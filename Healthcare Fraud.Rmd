@@ -1,0 +1,2118 @@
+---
+title: "transactional Fraud"
+author: "Envoy Nzimba(NZMENV001)"
+date: "2025-05-05"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r}
+#install.packages("randomForest")
+#install.packages("caret")
+library(scales)
+library(tidyverse)
+library(ggplot2)
+library(openxlsx)
+library(corrplot)
+library(randomForest)
+library(corrplot)
+library(randomForest)
+library(gridExtra)
+library(caret)
+library(glmnet)
+#install.packages("smotefamily")
+library(smotefamily)
+library(pROC)
+library(MASS)  # for stepAIC
+library(xgboost)
+library(rpart)
+library(rpart.plot)
+```
+
+
+```{r}
+health_data <- read.csv("Health Fraud Detection_Training.csv")
+health_data
+
+```
+
+
+```{r}
+#Checking the structure of the data
+str(health_data)
+```
+
+```{r}
+summary(health_data)
+```
+
+Target variable Distribution
+
+```{r}
+health_dist <- health_data %>%
+  group_by( PotentialFraud) %>%
+  summarise(count = n()) %>%
+  mutate(percentage = (count / sum(count)) * 100)
+
+ggplot(health_dist, aes(x = as.factor(PotentialFraud), y = count, fill = as.factor(PotentialFraud))) +
+  geom_bar(stat = "identity", width = 0.6) +
+  geom_text(
+    aes(label = paste0(count, " (", round(percentage, 1), "%)")), 
+    vjust = -0.3, size = 5.5, fontface = "bold"   # bold count labels
+  ) +
+  scale_fill_manual(values = c("#4682B4", "#D2691E")) +
+  labs(
+    title = "Fraud Distribution",
+    x = "PotentialFraud",
+    y = "Count"
+  ) +
+  theme_minimal(base_size = 16) +
+  theme(
+    plot.title = element_text(
+      face = "bold",   # make title bold
+      size = 20,       # increase title size
+      hjust = 0.5      # center the title
+    ),
+    axis.title = element_text(face = "bold", size = 14),
+    axis.text = element_text(size = 12),
+    legend.position = "none"
+  ) +
+  expand_limits(y = max(health_dist$count) * 1.1) +  # give labels space above bars
+  scale_y_continuous(labels = comma)
+```
+
+
+Investigating Missing values
+
+```{r}
+#checking missing values
+sapply(health_data, function(x) sum(is.na(x) | x == ""))
+
+```
+An assessment of the dataset revealed that several variables contained substantial missing or blank values. Notably, the Age variable had the highest proportion of missing entries, with 49,585 instances. Other fields such as Surgeon, Alt_Physician_ID, DiagnosisGroupCode, and ClmAdmitDiagnosisCode also exhibited significant levels of missing data, each exceeding 30,000 records. In contrast, core financial variables (e.g., ClaimAmtReimbursed, AnnualAmtReimb_OP, and AnnualAmtDeductible_OP) and all binary flag indicators (e.g., Flag_Alzheimer, Flag_Cancer) were found to be complete, containing no missing or blank values. This evaluation informed subsequent decisions regarding data cleaning, including column selection, imputation strategies, and exclusions for robust model development.
+
+
+```{r}
+# Calculate proportion of missing and blank values
+missing_prop <- sapply(health_data, function(x) {
+  sum(is.na(x) | x == "") / length(x)
+})
+
+# Convert to data frame for plotting
+missing_df <- data.frame(
+  Feature = names(missing_prop),
+  MissingProportion = round(missing_prop, 4)
+)
+
+# Sort by proportion (optional)
+missing_df <- missing_df[order(-missing_df$MissingProportion), ]
+
+missing_df
+```
+
+
+```{r}
+ggplot(missing_df, aes(x = reorder(Feature, MissingProportion), y = MissingProportion)) + geom_bar(stat = "identity", fill = "tomato") + coord_flip() + theme_minimal() + labs(title = "Proportion of Missing and Blank Values by Feature", x = "Feature", y = "Proportion Missing")
+
+```
+the Age variable had a missing proportion of nearly 100%, followed closely by DiagnosisGroupCode, Date_Discharge, Date_Admission, and Surgeon, all exceeding 75%. Other features show no missing data. The vosul shows very few missing values in Physician_ID and Amount Deductible. We are going to remove the features with missing values proportions that are significant. I will also remove identifier like Physician_ID since they do not carry predictive value. 
+
+```{r}
+# Identify columns with missing/blank proportion <= 10%
+cleaned_health_data <- health_data[, sapply(health_data, function(x) {
+  mean(is.na(x) | x == "") <= 0.10
+})]
+
+cleaned_health_data
+```
+
+
+I am now converting the claim start date and claim end date into date fromat 
+
+```{r}
+
+cleaned_health_data$Date_StartClm <- as.Date(health_data$Date_StartClm, format = "%m/%d/%Y")
+cleaned_health_data$Date_EndClm <- as.Date(health_data$Date_EndClm, format = "%m/%d/%Y")
+
+cleaned_health_data$PotentialFraud <- as.factor(cleaned_health_data$PotentialFraud)
+
+cleaned_health_data
+
+
+```
+
+
+```{r}
+#feature engineering from the dates
+
+#Claim duration
+cleaned_health_data$Claim_Duration <- as.numeric(cleaned_health_data$Date_EndClm - cleaned_health_data$Date_StartClm)
+
+
+#Claim month
+cleaned_health_data$Claim_Month <- format(cleaned_health_data$Date_StartClm, "%Y-%m")
+
+cleaned_health_data
+
+```
+
+
+```{r}
+fraud_time_data <- cleaned_health_data %>%
+  group_by(Date_StartClm, PotentialFraud) %>%
+  summarise(Claim_Count = n(), .groups = "drop")
+
+ggplot(fraud_time_data, aes(x = Date_StartClm, y = Claim_Count, color = PotentialFraud)) +
+  geom_line() +
+  theme_minimal() +
+  labs(title = "Fraud vs. Non-Fraud Claims Over Time",
+       x = "Claim Start Date",
+       y = "Number of Claims",
+       color = "Fraud Status") +
+  scale_y_continuous(labels = scales::comma)
+
+
+```
+This plot tracks the number of claims submitted per day, grouped by fraud status. Non-fraudulent claims remain consistently higher than fraudulent ones over time, with a relatively smooth trend. Fraudulent claims exhibit more fluctuation but maintain a steady presence across the year. Notably, there is an initial spike in fraud cases early in 2009, which could reflect either a reporting anomaly or a coordinated fraud pattern.
+
+```{r}
+# Group by Date and Fraud Status, then sum claims
+amount_by_fraud <- cleaned_health_data %>%
+  group_by(Date_StartClm, PotentialFraud) %>%
+  summarise(Total_Claim = sum(ClaimAmtReimbursed, na.rm = TRUE), .groups = "drop")
+
+ggplot(amount_by_fraud, aes(x = Date_StartClm, y = Total_Claim, color = PotentialFraud)) +
+  geom_line() +
+  theme_minimal() +
+  labs(title = "Total Claim Amount Per Day by Fraud Status",
+       x = "Claim Start Date",
+       y = "Total Claim Amount",
+       color = "Fraud Status") +
+  scale_y_continuous(labels = scales::comma)
+
+```
+The line chart presents daily total claim amounts separated by fraud status. Both fraudulent and non-fraudulent claims demonstrate high volatility in daily totals, with several peaks exceeding 200,000. The overlap between the two lines indicates that fraudulent and non-fraudulent claims occur at similar scales and frequencies, making it difficult to distinguish fraud by aggregate daily amounts alone. This supports the need for multivariate analysis to detect fraud patterns more effectively.
+
+
+```{r}
+claims_by_month_fraud <- cleaned_health_data %>%
+  group_by(Claim_Month, PotentialFraud) %>%
+  summarise(Claim_Count = n(), .groups = "drop")
+
+ggplot(claims_by_month_fraud, aes(x = Claim_Month, y = Claim_Count, fill = PotentialFraud)) +
+  geom_bar(stat = "identity") +
+  theme_minimal() +
+  labs(title = "Monthly Claim Count by Fraud Status",
+       x = "Month",
+       y = "Number of Claims",
+       fill = "Fraud Status") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+
+```
+The stacked bar chart shows monthly trends in claim submissions across 2009, disaggregated by fraud status. While non-fraudulent claims (in red) consistently make up the majority each month, fraudulent claims (in teal) represent a significant and relatively stable proportion. This stability suggests that fraudulent activity is persistent throughout the year and not concentrated in specific months, reinforcing the need for continuous fraud monitoring.
+
+
+Are fraud cases associated with higher claim amounts?
+```{r}
+ggplot(cleaned_health_data, aes(x = PotentialFraud, y = ClaimAmtReimbursed)) +
+  geom_boxplot(fill = "skyblue") +
+  theme_minimal(base_size = 16) +
+  labs(
+    title = "Claim Amounts by Fraud Status",
+    x = "Fraud Status",
+    y = "Claim Amount"
+  ) +
+  theme(
+    plot.title = element_text(
+      face = "bold",   # make title bold
+      size = 18,       # enlarge the title
+      hjust = 0.5      # center the title
+    ),
+    axis.title = element_text(face = "bold", size = 14),
+    axis.text = element_text(size = 12)
+  )
+
+```
+The scatter or dot plot illustrates the distribution of claim amounts across fraud statuses. Both fraudulent (1) and non-fraudulent (0) claims exhibit similar ranges, with a majority of claims clustering below 40,000. However, both groups also have a small number of extreme outliers approaching or exceeding 100,000. The similarity in distributions implies that fraud is not necessarily driven by high-amount claims but may involve manipulation of smaller, more frequent claims.
+
+
+Are certain physicians linked to more fraud cases?
+```{r}
+top_fraud_physicians <- cleaned_health_data %>%
+  filter(PotentialFraud == 1) %>%
+  group_by(Physician_ID) %>%
+  summarise(Fraud_Count = n()) %>%
+  arrange(desc(Fraud_Count)) %>%
+  slice_head(n = 10)
+
+ggplot(top_fraud_physicians, aes(x = reorder(Physician_ID, Fraud_Count), y = Fraud_Count)) +
+  geom_bar(stat = "identity", fill = "firebrick") +
+  coord_flip() +
+  theme_minimal() +
+  labs(title = "Top 10 Physicians by Number of Fraudulent Claims",
+       x = "Physician ID",
+       y = "Number of Fraudulent Claims")
+
+```
+The bar chart displays the top 10 physicians most frequently associated with fraudulent claims. Physician PHY330576 stands out with over 200 fraudulent claims, followed by several others with over 100. This concentration suggests that a small subset of physicians may be disproportionately contributing to fraudulent activity, indicating potential abuse or systemic weaknesses in oversight mechanisms.
+
+
+Are certain chronic conditions overrepresented in fraud cases?
+```{r}
+# Select only Flag columns + fraud indicator
+flags_data <- cleaned_health_data %>%
+  dplyr::select(starts_with("Flag_"), PotentialFraud)
+
+# Calculate percentage of each flag by fraud status
+flag_summary <- flags_data %>%
+  group_by(PotentialFraud) %>%
+  summarise(across(starts_with("Flag_"), ~ mean(.x, na.rm = TRUE))) %>%
+  pivot_longer(-PotentialFraud, names_to = "Condition", values_to = "Proportion")
+
+ggplot(flag_summary, aes(x = reorder(Condition, Proportion), y = Proportion, fill = PotentialFraud)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  coord_flip() +
+  theme_minimal() +
+  labs(title = "Proportion of Chronic Conditions by Fraud Status",
+       x = "Chronic Condition",
+       y = "Proportion of Claims",
+       fill = "Fraud Status") +
+  scale_y_continuous(labels = scales::percent_format())
+
+```
+The comparative analysis of chronic condition flags reveals key distinctions in the prevalence of specific medical conditions between fraudulent and non-fraudulent claims. Notably, conditions such as Ischemic Heart Disease, Diabetes, and Heart Failure are the most commonly flagged in both groups, with fraudulent claims exhibiting slightly higher proportions across most of these top conditions.
+
+For instance, approximately 75% of fraudulent claims involve patients flagged for Ischemic Heart Disease, compared to a slightly lower percentage in non-fraudulent claims. Similarly, Diabetes and Heart Failure appear more frequently in fraudulent submissions. This pattern may suggest potential overrepresentation or misclassification of chronic conditions to justify higher reimbursements, which is a known fraud tactic in healthcare claims.
+
+In contrast, lower-prevalence conditions such as Renal Disease, Cancer, Stroke, and Dead on Arrival (DOA) appear infrequently and exhibit less variation between fraud groups, suggesting they are not strongly associated with fraudulent behaviour in this dataset.
+
+These findings support the hypothesis that certain high-frequency chronic conditions may be deliberately manipulated or exploited in fraud cases, reinforcing the need for targeted feature selection and domain-specific fraud detection mechanisms.
+
+
+OVERAL ANALYSIS
+The visual analysis revealed a persistent and evenly distributed pattern of fraudulent activity across time, suggesting that fraud is systemic rather than seasonal. Notably, a small number of physicians were responsible for a disproportionate number of fraud cases, indicating potential provider-level exploitation. While the distribution of claim amounts between fraudulent and non-fraudulent records was largely similar, fraudulent claims were found across a wide value range, refuting the notion that only high-value claims are fraudulent. Daily and monthly trends further illustrated that fraud closely tracks overall claim activity, reinforcing the need for fraud detection models that rely on multidimensional patterns rather than simple thresholds. These insights laid the foundation for the feature engineering and modelling approaches adopted in the subsequent phase of the study.
+
+
+
+Are fraudulent claims longer or shorter?
+
+```{r}
+
+ggplot(cleaned_health_data, aes(x = as.factor(PotentialFraud), y = Claim_Duration)) +
+  geom_boxplot(fill = "steelblue") +
+  theme_minimal() +
+  labs(title = "Claim Duration by Fraud Status",
+       x = "Fraud Status (0 = Non-Fraud, 1 = Fraud)",
+       y = "Claim Duration (days)")
+
+
+```
+The analysis of claim duration across fraud status revealed minimal variation between fraudulent and non-fraudulent claims. As illustrated in the boxplot, the majority of claims, regardless of classification, had durations of one day or less, indicating that most episodes of care were reported as single-day treatments. Although a small number of outlier cases extended beyond 30 days, these were equally distributed across both fraud statuses. This suggests that claim duration alone is not a strong differentiator of fraud in this dataset, and fraudulent behavior is not necessarily associated with extended treatment timelines.
+
+
+As we have noticed when we investigate missing values in earlier, physical_ID and Amount deductible have missing values. physical_ID does not contribute to any predictive power, hence removing it is ideal. As a result i will use median imputation on Amount deductible feature. 
+
+```{r}
+#checking missing values
+sapply(cleaned_health_data, function(x) sum(is.na(x) | x == ""))
+```
+
+
+```{r}
+#Remove Physician_ID
+cleaned_health_data <- cleaned_health_data %>%
+  dplyr::select(-Physician_ID)
+
+# Converting blanks in Amt_Deductible to NA
+cleaned_health_data$Amt_Deductible[cleaned_health_data$Amt_Deductible == ""] <- NA
+
+# Convert Amt_Deductible to numeric (if needed)
+cleaned_health_data$Amt_Deductible <- as.numeric(cleaned_health_data$Amt_Deductible)
+
+# Imputing missing values with median
+median_amt <- median(cleaned_health_data$Amt_Deductible, na.rm = TRUE)
+cleaned_health_data$Amt_Deductible[is.na(cleaned_health_data$Amt_Deductible)] <- median_amt
+
+```
+
+```{r}
+#checking missing values
+sapply(cleaned_health_data, function(x) sum(is.na(x) | x == ""))
+```
+
+```{r}
+summary(cleaned_health_data$Amt_Deductible)
+```
+
+
+
+ Now we investigate the correlation of features
+```{r}
+# Remove unwanted columns
+numeric_data <- cleaned_health_data %>%
+  dplyr::select(where(is.numeric)) %>%                              # Keep only numeric columns
+  dplyr::select(-starts_with("Flag_"))                            # Remove binary flag features
+                           
+# Compute correlation matrix
+cor_matrix <- cor(numeric_data, use = "pairwise.complete.obs")
+
+# Plot correlation matrix
+corrplot::corrplot(cor_matrix,
+                   method = "color",
+                   type = "upper",
+                   addCoef.col = "black",
+                   number.cex = 0.7,
+                   tl.cex = 0.8,
+                   tl.col = "black")
+
+```
+
+The variable AnnualAmtReimb_OP showed a strong correlation (r = 0.82) with AnnualAmtDeductible_OP, suggesting multicollinearity. We are going to keep ClaimAmtReimbursed because It is likely a more direct measure of actual payment made. We are going to remove the date as wel.
+
+```{r}
+#Removing AnnualAmtDeductible_OP and Date
+cleaned_health_data <- cleaned_health_data %>% dplyr::select(-c(AnnualAmtDeductible_OP,Date_StartClm,Date_EndClm))
+
+
+```
+
+
+Investigating outliers
+```{r}
+
+# Step 1: Copy relevant columns including PotentialFraud
+fraud_outlier_data <- cleaned_health_data %>%
+  dplyr::select(PotentialFraud, where(is.numeric)) %>%
+  dplyr::select(-starts_with("Flag_"))  # remove binary flags
+
+# Step 2: Convert PotentialFraud to factor (if not already)
+fraud_outlier_data$PotentialFraud <- as.factor(fraud_outlier_data$PotentialFraud)
+
+# Step 3: Gather data for easier processing
+long_data <- fraud_outlier_data %>%
+  gather(key = "Feature", value = "Value", -PotentialFraud)
+
+# Step 4: Compute outlier flags using IQR
+outlier_flagged <- long_data %>%
+  group_by(Feature) %>%
+  mutate(
+    Q1 = quantile(Value, 0.25, na.rm = TRUE),
+    Q3 = quantile(Value, 0.75, na.rm = TRUE),
+    IQR = Q3 - Q1,
+    Lower = Q1 - 1.5 * IQR,
+    Upper = Q3 + 1.5 * IQR,
+    Outlier = ifelse(Value < Lower | Value > Upper, 1, 0)
+  ) %>%
+  ungroup()
+
+# Step 5: Summarise outliers by fraud status
+outlier_by_fraud <- outlier_flagged %>%
+  group_by(Feature, PotentialFraud) %>%
+  summarise(
+    Total = n(),
+    Outliers = sum(Outlier, na.rm = TRUE),
+    Outlier_Percent = round(100 * Outliers / Total, 2),
+    .groups = 'drop'
+  ) %>%
+  arrange(desc(Outlier_Percent))
+
+# Show the summary
+print(outlier_by_fraud)
+
+
+```
+
+
+
+
+```{r}
+ggplot(outlier_by_fraud, aes(x = reorder(Feature, -Outlier_Percent), y = Outlier_Percent, fill = PotentialFraud)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  coord_flip() +
+  labs(title = "Outlier Percentage per Feature by Fraud Status",
+       x = "Feature", y = "Outlier %") +
+  theme_minimal()
+
+```
+
+An outlier analysis was conducted across selected numeric features to evaluate whether fraudulent claims exhibit abnormal patterns. As shown in Figure X, ClaimAmtReimbursed had the highest outlier percentage among fraudulent claims (20%), compared to 15% for non-fraudulent. Similarly, Amt_Deductible and AnnualAmtReimb_IP also showed elevated outlier rates for fraud cases. These findings suggest that fraudulent behavior is often associated with unusually high or inconsistent financial figures, reinforcing the need to consider these features during anomaly detection and fraud classification.
+
+
+```{r}
+str(cleaned_health_data)
+
+
+```
+
+
+Variable Importance with Random Forest 
+
+```{r}
+cleaned_health_data <- cleaned_health_data %>%
+  mutate(
+    Gender = as.factor(Gender)
+  ) %>% dplyr::select(-Claim_Month)
+
+# Random Forest for Variable Importance (on full data)
+set.seed(123)
+rf_model_health <- randomForest(PotentialFraud ~ ., data = cleaned_health_data,
+                              importance = TRUE, ntree = 500)
+
+# Plot variable importance
+varImpPlot(rf_model_health, main = "Variable Importance (Random Forest)")
+
+```
+
+
+```{r}
+# Creating a cleaner plot
+importance_df_health <- as.data.frame(importance(rf_model_health))
+importance_df_health$Variable <- rownames(importance_df_health)
+
+# Plotting using ggplot2
+ggplot(importance_df_health, 
+       aes(x = reorder(Variable, MeanDecreaseGini), y = MeanDecreaseGini)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  coord_flip() +
+  labs(
+    title = "Random Forest Feature Importance",
+    x = "Variables",
+    y = "Mean Decrease Gini"
+  ) +
+  theme_minimal(base_size = 16) +
+  theme(
+    plot.title = element_text(
+      face = "bold",   # make title bold
+      size = 18,       # enlarge title
+      hjust = 0.5      # center title
+    ),
+    axis.title = element_text(face = "bold", size = 14),
+    axis.text = element_text(size = 12)
+  )
+```
+
+A Random Forest classifier was applied to assess variable importance across the dataset, using the Gini impurity-based mean decrease as the evaluation metric. The model revealed that the most influential features in distinguishing fraudulent from non-fraudulent claims were AnnualAmtReimb_OP, ClaimAmtReimbursed, and AnnualAmtReimb_IP. These reimbursement-related features consistently demonstrated a significantly higher mean decrease in Gini index, suggesting that abnormal financial claim behaviour is a key indicator of fraud. Additionally, variables such as AnnualAmtDeductible_IP and Amt_Deductible also ranked moderately high, further reinforcing the pattern that monetary attributes of claims are critical signals in fraud detection. Among the demographic and clinical flag features, Gender, Flag_Alzheimer, and Flag_Osteoporosis showed moderate importance, whereas other chronic condition indicators such as Flag_Stroke and Flag_DOA had minimal contribution. These results guided the selection of a reduced feature set for logistic regression, retaining the most predictive attributes while minimizing noise and redundancy.
+
+
+
+BUILIND THE BASELINE MODEL: LOGISTIC REGRESSION
+
+I want to scale some features first
+
+
+
+```{r}
+# Identify numeric columns
+numeric_cols <- cleaned_health_data %>% dplyr::select(where(is.numeric)) %>% names()
+
+# Identify binary numeric columns (0 or 1 only)
+binary_cols <- cleaned_health_data %>%
+  dplyr::select(all_of(numeric_cols)) %>%
+  dplyr::select_if(~ all(na.omit(.) %in% c(0, 1))) %>%
+  names()
+
+# Get numeric columns to scale (excluding binary ones)
+scale_cols <- setdiff(numeric_cols, binary_cols)
+
+# Scale only the selected columns
+cleaned_health_data[scale_cols] <- scale(cleaned_health_data[scale_cols])
+
+
+
+
+```
+
+ Stratified Train-Test Split 
+
+```{r}
+# Encode Gender as binary
+cleaned_health_data <- cleaned_health_data %>%
+  mutate(Gender = ifelse(Gender == "Male", 1, 0))
+
+# Stratified Split
+set.seed(123)
+trainIndex <- createDataPartition(cleaned_health_data$PotentialFraud, p = 0.7, list = FALSE)
+train_data <- cleaned_health_data[trainIndex, ]
+test_data  <- cleaned_health_data[-trainIndex, ]
+
+table(train_data$PotentialFraud)
+table(test_data$PotentialFraud)
+
+
+```
+
+
+```{r}
+# Prepare features and target
+X_train <- train_data %>% dplyr::select(-PotentialFraud)
+y_train <- train_data$PotentialFraud
+X_test <- test_data %>% dplyr::select(-PotentialFraud)
+y_test <- test_data$PotentialFraud
+
+```
+
+
+Baseline Logistic Regression with Stepwise AIC
+```{r}
+# Convert target to numeric (0/1) for glm
+train_data$PotentialFraud <- as.numeric(as.character(train_data$PotentialFraud))
+test_data$PotentialFraud <- as.numeric(as.character(test_data$PotentialFraud))
+y_test <- as.factor(test_data$PotentialFraud)
+
+set.seed(123)
+start_time <- Sys.time()
+initial_baseline_model <- glm(PotentialFraud ~ ., data = train_data, family = "binomial")
+baseline_model <- stepAIC(initial_baseline_model, direction = "both", trace = FALSE)
+
+pred_probs_baseline <- predict(baseline_model, newdata = X_test, type = "response")
+end_time <- Sys.time()
+runtime_baseline_logistic <- as.numeric(difftime(end_time, start_time, units = "secs"))
+runtime_baseline_logistic
+
+pred_class_baseline <- factor(ifelse(pred_probs_baseline > 0.5, 1, 0), levels = c(0, 1))
+cm_baseline <- confusionMatrix(pred_class_baseline, y_test, positive = "1")
+roc_baseline <- roc(as.numeric(as.character(y_test)), pred_probs_baseline)
+
+print(cm_baseline)
+
+```
+
+
+
+SMOTE + Logistic Regression
+
+```{r}
+set.seed(123)
+X_train_df <- as.data.frame(X_train)
+smote_data <- SMOTE(X_train_df, y_train)
+X_train_smote <- smote_data$data[, -ncol(smote_data$data)]
+y_train_smote <- as.factor(smote_data$data$class)
+smote_train_data <- cbind(X_train_smote, PotentialFraud = y_train_smote)
+
+start_time <- Sys.time()
+
+initial_smote_model <- glm(PotentialFraud ~ ., data = smote_train_data, family = "binomial")
+smote_model <- stepAIC(initial_smote_model, direction = "both", trace = FALSE)
+
+pred_probs_smote <- predict(smote_model, newdata = X_test, type = "response")
+
+end_time <- Sys.time()
+
+runtime_smote_logistic <- as.numeric(difftime(end_time, start_time, units = "secs"))
+runtime_smote_logistic
+
+pred_class_smote <- factor(ifelse(pred_probs_smote > 0.5, 1, 0), levels = c(0, 1))
+cm_smote <- confusionMatrix(pred_class_smote, y_test, positive = "1")
+roc_smote <- roc(as.numeric(as.character(y_test)), pred_probs_smote)
+
+print(cm_smote)
+
+```
+
+
+
+ADASYN + Logistic Regression
+```{r}
+set.seed(123)
+adasyn_data <- ADAS(X_train_df, y_train)
+X_train_adasyn <- adasyn_data$data[, -ncol(adasyn_data$data)]
+y_train_adasyn <- as.factor(adasyn_data$data$class)
+adasyn_train_data <- cbind(X_train_adasyn, PotentialFraud = y_train_adasyn)
+
+start_time <- Sys.time()
+
+initial_adasyn_model <- glm(PotentialFraud ~ ., data = adasyn_train_data, family = "binomial")
+adasyn_model <- stepAIC(initial_adasyn_model, direction = "both", trace = FALSE)
+
+pred_probs_adasyn <- predict(adasyn_model, newdata = X_test, type = "response")
+
+end_time <- Sys.time()
+runtime_adasyn_logistic <- as.numeric(difftime(end_time, start_time, units = "secs"))
+runtime_adasyn_logistic
+
+pred_class_adasyn <- factor(ifelse(pred_probs_adasyn > 0.5, 1, 0), levels = c(0, 1))
+cm_adasyn <- confusionMatrix(pred_class_adasyn, y_test, positive = "1")
+roc_adasyn <- roc(as.numeric(as.character(y_test)), pred_probs_adasyn)
+
+print(cm_adasyn)
+```
+
+```{r}
+#Saving the model
+# 1.4 Save the fitted (stepwise) model
+model_path <- "logit_adasyn_healthcare.rds"
+saveRDS(adasyn_model, model_path)
+cat("Model saved to:", model_path, "\n")
+```
+
+```{r}
+# 2.1 Load the saved model
+loaded_model <- readRDS("logit_adasyn_healthcare.rds")
+
+# 2.2 Prepare test data
+X_test_df      <- as.data.frame(X_test)
+y_test_factor  <- y_test
+y_test_numeric <- as.numeric(as.character(y_test_factor))
+
+# 2.3 Build a 500-sample demo with ~50% fraud for visibility
+set.seed(42)
+fraud_idx    <- which(y_test_numeric == 1)
+nonfraud_idx <- which(y_test_numeric == 0)
+
+n_fraud    <- 250
+n_nonfraud <- 250
+
+demo_fraud_idx    <- if (length(fraud_idx) < n_fraud)
+  sample(fraud_idx, n_fraud, replace = TRUE) else sample(fraud_idx, n_fraud)
+demo_nonfraud_idx <- sample(nonfraud_idx, n_nonfraud)
+
+demo_idx   <- sample(c(demo_fraud_idx, demo_nonfraud_idx))
+X_demo_df  <- X_test_df[demo_idx, , drop = FALSE]
+y_demo_fac <- y_test_factor[demo_idx]                 # factor {0,1}
+y_demo_num <- as.numeric(as.character(y_demo_fac))    # numeric {0,1}
+
+# 2.4 Real-time single-instance loop
+latencies <- numeric(length(y_demo_num))
+probs     <- numeric(length(y_demo_num))
+preds     <- integer(length(y_demo_num))
+
+for (i in seq_along(y_demo_num)) {
+  # one-row data.frame preserving column names/types
+  row_df <- X_demo_df[i, , drop = FALSE]
+  
+  t0 <- Sys.time()
+  p  <- predict(loaded_model, newdata = row_df, type = "response")
+  t1 <- Sys.time()
+  
+  latencies[i] <- as.numeric(difftime(t1, t0, units = "secs"))
+  probs[i]     <- p
+  preds[i]     <- as.integer(p > 0.5)   # adjust cutoff if you want higher recall
+  
+  Sys.sleep(0.5)  # simulate arrival delay
+}
+```
+
+```{r}
+# Summarizing performance
+cat(sprintf("Simulated %d instances (≈50%% fraud)\n", length(y_demo_num)))
+cat(sprintf("Avg inference time/sample: %.4fs\n", mean(latencies)))
+cat(sprintf("Min inference time/sample: %.4fs\n", min(latencies)))
+cat(sprintf("Max inference time/sample: %.4fs\n\n", max(latencies)))
+
+```
+
+```{r}
+cm <- confusionMatrix(
+  factor(preds, levels = c(0, 1)),
+  factor(y_demo_fac, levels = c(0, 1)),
+  positive = "1"
+)
+auc_value <- auc(y_demo_num, probs)
+
+cat("Confusion Matrix (500-sample Stratified Demo):\n")
+print(cm$table)
+cat(sprintf("ROC AUC: %.4f\n", auc_value))
+```
+
+
+Cost-sensitive Logistic Regression
+```{r}
+set.seed(123)
+weight_for_0 <- sum(y_train == 1) / sum(y_train == 0)
+weight_for_1 <- 1
+weights_vec <- ifelse(y_train == 0, weight_for_0, weight_for_1)
+
+start_time <- Sys.time()
+initial_cost_model <- glm(PotentialFraud ~ ., data = train_data,
+                          family = "binomial", weights = weights_vec)
+cost_sensitive_model <- stepAIC(initial_cost_model, direction = "both", trace = FALSE)
+
+pred_probs_cost <- predict(cost_sensitive_model, newdata = X_test, type = "response")
+end_time <- Sys.time()
+
+runtime_cost_logistic <- as.numeric(difftime(end_time, start_time, units = "secs"))
+runtime_cost_logistic
+
+pred_class_cost <- factor(ifelse(pred_probs_cost > 0.5, 1, 0), levels = c(0, 1))
+cm_cost <- confusionMatrix(pred_class_cost, y_test, positive = "1")
+roc_cost <- roc(as.numeric(as.character(y_test)), pred_probs_cost)
+
+print(cm_cost)
+```
+
+
+Plotting ROC Curves
+```{r}
+plot(roc_baseline, col = "blue", lwd = 2, main = "ROC Curves for Logistic Models(Healthcare Fraud)",legacy.axes=TRUE, xlim = c(1, 0),xlab = "False Positive Rate",ylab = "True Positive Rate")
+lines(roc_smote, col = "green", lwd = 2)
+lines(roc_adasyn, col = "red", lwd = 2)
+lines(roc_cost, col = "purple", lwd = 2)
+legend("bottomright", legend = c("Baseline", "SMOTE", "ADASYN", "Cost-sensitive"),
+       col = c("blue", "green", "red", "purple"), lwd = 2)
+
+```
+
+
+
+
+
+
+
+Comparing Metrics
+```{r}
+results_logistic_fraud <- data.frame(
+  Method = c("Baseline", "SMOTE", "ADASYN", "Cost-sensitive"),
+  Accuracy = c(
+    cm_baseline$overall["Accuracy"],
+    cm_smote$overall["Accuracy"],
+    cm_adasyn$overall["Accuracy"],
+    cm_cost$overall["Accuracy"]
+  ),
+  Precision = c(
+    cm_baseline$byClass["Precision"],
+    cm_smote$byClass["Precision"],
+    cm_adasyn$byClass["Precision"],
+    cm_cost$byClass["Precision"]
+  ),
+  Recall = c(
+    cm_baseline$byClass["Recall"],
+    cm_smote$byClass["Recall"],
+    cm_adasyn$byClass["Recall"],
+    cm_cost$byClass["Recall"]
+  ),
+  F1 = c(
+    cm_baseline$byClass["F1"],
+    cm_smote$byClass["F1"],
+    cm_adasyn$byClass["F1"],
+    cm_cost$byClass["F1"]
+  ),
+  AUC = c(
+    auc(roc_baseline),
+    auc(roc_smote),
+    auc(roc_adasyn),
+    auc(roc_cost)
+  )
+)
+
+
+print(results_logistic_fraud)
+
+
+```
+
+
+
+
+View Final Selected Features
+
+```{r}
+cat("\n▶ Features selected by Stepwise AIC:\n")
+cat("Baseline Model:\n"); print(formula(baseline_model)); cat("\n")
+cat("SMOTE Model:\n"); print(formula(smote_model)); cat("\n")
+cat("ADASYN Model:\n"); print(formula(adasyn_model)); cat("\n")
+cat("Cost-sensitive Model:\n"); print(formula(cost_sensitive_model)); cat("\n")
+
+```
+
+
+
+
+XG-Boost ON ALL METHODS
+
+XGBoost Baseline Model with Tuned Hyperparameters
+
+```{r}
+# Convert to matrix
+X_train_matrix <- as.matrix(X_train)
+X_test_matrix  <- as.matrix(X_test)
+y_train_numeric <- as.numeric(as.character(y_train))
+y_test_numeric  <- as.numeric(as.character(y_test))
+
+# XGBoost Parameters
+xgb_params <- list(
+  objective = "binary:logistic",
+  eval_metric = "auc",
+  subsample = 0.8,
+  colsample_bytree = 0.6,
+  max_depth = 8,
+  eta = 0.02
+)
+```
+
+
+
+# Train baseline model
+```{r}
+# Train baseline model
+set.seed(123)
+
+start_time <- Sys.time()
+
+xgb_baseline <- xgboost(
+  data = X_train_matrix,
+  label = y_train_numeric,
+  params = xgb_params,
+  nrounds = 100,
+  verbose = 0
+)
+
+# Predict & Evaluate
+pred_probs_xgb <- predict(xgb_baseline, X_test_matrix)
+end_time <- Sys.time()
+runtime_xgb <- as.numeric(difftime(end_time, start_time, units = "secs"))
+runtime_xgb
+
+pred_class_xgb <- ifelse(pred_probs_xgb > 0.5, 1, 0)
+cm_xgb <- confusionMatrix(factor(pred_class_xgb, levels = c(0, 1)), factor(y_test_numeric), positive = "1")
+roc_xgb <- roc(y_test_numeric, pred_probs_xgb)
+
+print(cm_xgb)
+```
+SHAP Analysis for XGboost Baseline
+```{r}
+# Step 1: Convert training data to data.table format
+X_train_baseline_dt <- as.data.table(X_train_matrix)
+
+# Step 2: Create DMatrix for SHAP prediction
+dtrain_baseline <- xgb.DMatrix(data = as.matrix(X_train_baseline_dt), label = y_train_numeric)
+
+# Step 3: Generate SHAP values (includes BIAS in last column)
+shap_contrib_baseline <- predict(xgb_baseline, dtrain_baseline, predcontrib = TRUE)
+
+# Step 4: Remove BIAS column
+shap_score_baseline_df <- as.data.frame(shap_contrib_baseline[, -ncol(shap_contrib_baseline)])
+
+# Step 5: Wrap in a list for SHAPforxgboost
+shap_values_baseline <- list(shap_score = shap_score_baseline_df)
+
+# Step 6: Prepare SHAP values for plotting
+shap_long_baseline <- shap.prep(
+  shap_contrib = shap_values_baseline$shap_score,
+  X_train = X_train_baseline_dt
+)
+
+# Step 7: SHAP summary plot (beeswarm)
+shap.plot.summary(shap_long_baseline)
+```
+
+```{r}
+write.csv(
+  shap_values_baseline$shap_score,
+  "healthcare_shap_values_baseline.csv",
+  row.names = FALSE
+)
+
+write.csv(
+  as.data.frame(X_train_baseline_dt),
+  "healthcare_X_train_baseline.csv",
+  row.names = FALSE
+)
+
+```
+
+
+
+
+
+SMOTE + XGBoost
+```{r}
+set.seed(123)
+smote_data <- SMOTE(X_train_df, y_train)
+X_train_smote <- as.matrix(smote_data$data[, -ncol(smote_data$data)])
+y_train_smote <- as.numeric(as.character(smote_data$data$class))
+
+start_time <- Sys.time()
+
+xgb_smote <- xgboost(
+  data = X_train_smote,
+  label = y_train_smote,
+  params = xgb_params,
+  nrounds = 100,
+  verbose = 0
+)
+
+pred_probs_smote_xgb <- predict(xgb_smote, X_test_matrix)
+end_time <- Sys.time()
+runtime_xgb_smote <- as.numeric(difftime(end_time, start_time, units = "secs"))
+runtime_xgb_smote
+
+
+pred_class_smote_xgb <- ifelse(pred_probs_smote_xgb > 0.5, 1, 0)
+cm_smote_xgb <- confusionMatrix(factor(pred_class_smote_xgb, levels = c(0, 1)), factor(y_test_numeric), positive = "1")
+roc_smote_xgb <- roc(y_test_numeric, pred_probs_smote_xgb)
+
+print(cm_smote_xgb)
+
+```
+
+SHAP Analysis for XGBoost SMOTE
+```{r}
+# Step 1: Convert SMOTE training data to data.table
+X_train_smote_dt <- as.data.table(X_train_smote)
+
+# Step 2: Create DMatrix for SHAP analysis
+dtrain_smote <- xgb.DMatrix(data = as.matrix(X_train_smote_dt), label = y_train_smote)
+
+# Step 3: Generate SHAP values (with BIAS term)
+shap_contrib_smote <- predict(xgb_smote, dtrain_smote, predcontrib = TRUE)
+
+# Step 4: Remove BIAS column
+shap_score_smote_df <- as.data.frame(shap_contrib_smote[, -ncol(shap_contrib_smote)])
+
+# Step 5: Wrap in list (as expected by SHAPforxgboost)
+shap_values_smote <- list(shap_score = shap_score_smote_df)
+
+# Step 6: Prepare long-format SHAP data
+shap_long_smote <- shap.prep(
+  shap_contrib = shap_values_smote$shap_score,
+  X_train = X_train_smote_dt
+)
+
+# Step 7: Beeswarm summary plot
+shap.plot.summary(shap_long_smote)
+```
+
+```{r}
+write.csv(
+  shap_values_smote$shap_score,
+  "healthcare_shap_values_smote.csv",
+  row.names = FALSE
+)
+
+write.csv(
+  as.data.frame(X_train_smote_dt),
+  "healthcare_X_train_smote.csv",
+  row.names = FALSE
+)
+
+```
+
+
+
+
+ADASYN + XGBoost
+```{r}
+set.seed(123)
+adasyn_data <- ADAS(X_train_df, y_train)
+X_train_adasyn <- as.matrix(adasyn_data$data[, -ncol(adasyn_data$data)])
+y_train_adasyn <- as.numeric(as.character(adasyn_data$data$class))
+
+start_time <- Sys.time()
+
+xgb_adasyn <- xgboost(
+  data = X_train_adasyn,
+  label = y_train_adasyn,
+  params = xgb_params,
+  nrounds = 100,
+  verbose = 0
+)
+
+pred_probs_adasyn_xgb <- predict(xgb_adasyn, X_test_matrix)
+
+end_time <- Sys.time()
+runtime_xgb_adasyn <- as.numeric(difftime(end_time, start_time, units = "secs"))
+runtime_xgb_adasyn
+
+pred_class_adasyn_xgb <- ifelse(pred_probs_adasyn_xgb > 0.5, 1, 0)
+cm_adasyn_xgb <- confusionMatrix(factor(pred_class_adasyn_xgb, levels = c(0, 1)), factor(y_test_numeric), positive = "1")
+roc_adasyn_xgb <- roc(y_test_numeric, pred_probs_adasyn_xgb)
+
+print(cm_adasyn_xgb)
+
+```
+
+```{r}
+# 1.5 Save model
+model_path <- "xgb_adasyn_healthcare.model"
+xgb.save(xgb_adasyn, model_path)
+cat("Model saved to:", model_path, "\n")
+```
+
+Experimenting different Thresholds 
+
+```{r}
+library(xgboost)
+library(caret)
+library(dplyr)
+
+# 1. Load the saved XGBoost model
+model_path <- "xgb_adasyn_healthcare.model"
+xgb_adasyn_loaded <- xgb.load(model_path)
+cat("Model loaded from:", model_path, "\n")
+
+# 2. Predict probabilities on the test set
+# Assumes X_test_matrix and y_test_numeric (0/1) are already in the environment
+pred_probs_adasyn_xgb <- predict(xgb_adasyn_loaded, X_test_matrix)
+
+# 3. Define thresholds to evaluate
+thresholds <- c(0.1, 0.3, 0.5, 0.7, 0.9)
+
+results_list <- list()
+
+for (t in thresholds) {
+  # Binarise predictions at threshold t
+  pred_class <- ifelse(pred_probs_adasyn_xgb > t, 1, 0)
+  
+  # Confusion matrix
+  cm <- confusionMatrix(
+    factor(pred_class, levels = c(0, 1)),
+    factor(y_test_numeric, levels = c(0, 1)),
+    positive = "1"
+  )
+  
+  acc  <- cm$overall["Accuracy"]
+  prec <- cm$byClass["Precision"]
+  rec  <- cm$byClass["Recall"]
+  
+  results_list[[as.character(t)]] <- data.frame(
+    Threshold = t,
+    Accuracy  = as.numeric(acc),
+    Precision = as.numeric(prec),
+    Recall    = as.numeric(rec)
+  )
+}
+
+# 4. Combine into a single results table
+results_healthcare_xgb <- bind_rows(results_list)
+
+print(results_healthcare_xgb)
+```
+
+
+
+
+
+
+
+```{r}
+# 2.1 Load the saved model
+loaded_model <- xgb.load("xgb_adasyn_healthcare.model")
+
+# 2.2 Build a 500-sample demo with ~50% fraud for visibility
+set.seed(42)
+fraud_idx    <- which(y_test_numeric == 1)
+nonfraud_idx <- which(y_test_numeric == 0)
+
+n_fraud    <- 250
+n_nonfraud <- 250
+
+demo_fraud_idx    <- if (length(fraud_idx) < n_fraud)
+  sample(fraud_idx, n_fraud, replace = TRUE) else sample(fraud_idx, n_fraud)
+demo_nonfraud_idx <- sample(nonfraud_idx, n_nonfraud)
+
+demo_idx <- sample(c(demo_fraud_idx, demo_nonfraud_idx))
+X_demo   <- X_test_matrix[demo_idx, , drop = FALSE]
+y_demo   <- y_test_numeric[demo_idx]
+
+# 2.3 Real-time loop (one instance at a time)
+latencies <- numeric(length(y_demo))
+preds     <- integer(length(y_demo))
+probs     <- numeric(length(y_demo))
+
+for (i in seq_along(y_demo)) {
+  dmat <- xgb.DMatrix(data = matrix(X_demo[i, ], nrow = 1))
+  
+  t0 <- Sys.time()
+  p  <- predict(loaded_model, dmat)
+  t1 <- Sys.time()
+  
+  latencies[i] <- as.numeric(difftime(t1, t0, units = "secs"))
+  probs[i]     <- p
+  preds[i]     <- as.integer(p > 0.5)  # adjust threshold if you want higher recall
+  
+  Sys.sleep(0.5)  # simulate arrival delay
+}
+```
+
+
+```{r}
+# 2.4 Summarize real-time performance
+cat(sprintf("Simulated %d instances (≈50%% fraud)\n", length(y_demo)))
+cat(sprintf("Avg inference time/sample: %.4fs\n", mean(latencies)))
+cat(sprintf("Min inference time/sample: %.4fs\n", min(latencies)))
+cat(sprintf("Max inference time/sample: %.4fs\n\n", max(latencies)))
+```
+
+
+```{r}
+cm <- confusionMatrix(
+  factor(preds, levels = c(0, 1)),
+  factor(y_demo, levels = c(0, 1)),
+  positive = "1"
+)
+auc_value <- auc(y_demo, probs)
+
+cat("Confusion Matrix (500-sample Stratified Demo):\n")
+print(cm$table)
+cat(sprintf("ROC AUC: %.4f\n", auc_value))
+
+```
+
+
+
+
+SHAP Analysis for XGBoost ADASYN
+```{r}
+
+library(data.table)
+library(SHAPforxgboost)
+
+
+# Step 1: Convert ADASYN training data to data.table
+X_train_adasyn_dt <- as.data.table(X_train_adasyn)
+
+# Step 2: Create xgb.DMatrix object
+dtrain_adasyn <- xgb.DMatrix(data = as.matrix(X_train_adasyn_dt), label = y_train_adasyn)
+
+# Step 3: Predict SHAP values (including bias term)
+shap_contrib_adasyn <- predict(xgb_adasyn, dtrain_adasyn, predcontrib = TRUE)
+
+# Step 4: Remove BIAS column (last column)
+shap_score_adasyn_df <- as.data.frame(shap_contrib_adasyn[, -ncol(shap_contrib_adasyn)])
+
+# Step 5: Wrap SHAP scores in a list (as expected by shap.prep)
+shap_values_adasyn <- list(shap_score = shap_score_adasyn_df)
+
+# Step 6: Prepare long-format SHAP data
+shap_long_adasyn <- shap.prep(
+  shap_contrib = shap_values_adasyn$shap_score,
+  X_train = X_train_adasyn_dt
+)
+
+# Step 7: SHAP beeswarm plot
+shap.plot.summary(shap_long_adasyn)
+```
+
+
+```{r}
+# Export SHAP values (wide matrix, no bias term)
+write.csv(
+  shap_values_adasyn$shap_score,
+  "healthcare_shap_values_adasyn.csv",
+  row.names = FALSE
+)
+
+# Export ADASYN feature matrix
+write.csv(
+  as.data.frame(X_train_adasyn_dt),
+  "healthcare_X_train_adasyn.csv",
+  row.names = FALSE
+)
+
+```
+
+
+
+
+Cost-Sensitive XGBoost
+
+```{r}
+set.seed(123)
+weight_for_0 <- sum(y_train_numeric == 1) / sum(y_train_numeric == 0)
+weight_for_1 <- 1
+weights_vec <- ifelse(y_train_numeric == 0, weight_for_0, weight_for_1)
+
+start_time <- Sys.time()
+
+xgb_cost <- xgboost(
+  data = X_train_matrix,
+  label = y_train_numeric,
+  params = xgb_params,
+  nrounds = 100,
+  verbose = 0,
+  weight = weights_vec
+)
+
+pred_probs_cost_xgb <- predict(xgb_cost, X_test_matrix)
+end_time <- Sys.time()
+runtime_xgb_cost <- as.numeric(difftime(end_time, start_time, units = "secs"))
+runtime_xgb_cost
+
+pred_class_cost_xgb <- ifelse(pred_probs_cost_xgb > 0.5, 1, 0)
+cm_cost_xgb <- confusionMatrix(factor(pred_class_cost_xgb, levels = c(0, 1)), factor(y_test_numeric), positive = "1")
+roc_cost_xgb <- roc(y_test_numeric, pred_probs_cost_xgb)
+
+print(cm_cost_xgb)
+
+```
+
+SHAP Analysis for XGBoost Cost
+
+```{r}
+# Step 1: Convert training matrix to data.table
+X_train_cost_dt <- as.data.table(X_train_matrix)
+
+# Step 2: Create xgb.DMatrix object
+dtrain_cost <- xgb.DMatrix(data = as.matrix(X_train_cost_dt), label = y_train_numeric)
+
+# Step 3: Predict SHAP values (with BIAS column)
+shap_contrib_cost <- predict(xgb_cost, dtrain_cost, predcontrib = TRUE)
+
+# Step 4: Remove the BIAS column (last column)
+shap_score_cost_df <- as.data.frame(shap_contrib_cost[, -ncol(shap_contrib_cost)])
+
+# Step 5: Wrap in list format expected by SHAPforxgboost
+shap_values_cost <- list(shap_score = shap_score_cost_df)
+
+# Step 6: Prepare long-format data for plotting
+shap_long_cost <- shap.prep(
+  shap_contrib = shap_values_cost$shap_score,
+  X_train = X_train_cost_dt
+)
+
+# Step 7: Plot SHAP summary (beeswarm)
+shap.plot.summary(shap_long_cost)
+```
+
+
+```{r}
+# Export SHAP values (no bias column)
+write.csv(
+  shap_values_cost$shap_score,
+  "healthcare_shap_values_cost.csv",
+  row.names = FALSE
+)
+
+# Export feature matrix used for cost-sensitive model
+write.csv(
+  as.data.frame(X_train_cost_dt),
+  "healthcare_X_train_cost.csv",
+  row.names = FALSE
+)
+
+```
+
+
+Plot ROC for All XGBoost Models
+
+```{r}
+plot(roc_xgb, col = "blue", lwd = 2, main = "ROC Curves for XGBoost Models(Healthcare fraud)", xlim = c(1, 0),xlab = "False Positive Rate",ylab = "True Positive Rate")
+lines(roc_smote_xgb, col = "green", lwd = 2)
+lines(roc_adasyn_xgb, col = "red", lwd = 2)
+lines(roc_cost_xgb, col = "purple", lwd = 2)
+legend("bottomright", legend = c("Baseline", "SMOTE", "ADASYN", "Cost-sensitive"),
+       col = c("blue", "green", "red", "purple"), lwd = 2)
+
+```
+
+
+Compare All XGBoost Metrics
+
+```{r}
+results_xgb_fraud <- data.frame(
+  Method = c("Baseline", "SMOTE", "ADASYN", "Cost-sensitive"),
+  Accuracy = c(
+    cm_xgb$overall["Accuracy"],
+    cm_smote_xgb$overall["Accuracy"],
+    cm_adasyn_xgb$overall["Accuracy"],
+    cm_cost_xgb$overall["Accuracy"]
+  ),
+  Precision = c(
+    cm_xgb$byClass["Precision"],
+    cm_smote_xgb$byClass["Precision"],
+    cm_adasyn_xgb$byClass["Precision"],
+    cm_cost_xgb$byClass["Precision"]
+  ),
+  Recall = c(
+    cm_xgb$byClass["Recall"],
+    cm_smote_xgb$byClass["Recall"],
+    cm_adasyn_xgb$byClass["Recall"],
+    cm_cost_xgb$byClass["Recall"]
+  ),
+  F1 = c(
+    cm_xgb$byClass["F1"],
+    cm_smote_xgb$byClass["F1"],
+    cm_adasyn_xgb$byClass["F1"],
+    cm_cost_xgb$byClass["F1"]
+  ),
+  AUC = c(
+    auc(roc_xgb),
+    auc(roc_smote_xgb),
+    auc(roc_adasyn_xgb),
+    auc(roc_cost_xgb)
+  )
+)
+
+
+print(results_xgb_fraud)
+
+```
+
+
+
+RANDOM FOREST MODELS
+
+
+Grid Search for hyper-parameters
+
+----------------------
+ set.seed(123)
+
+# Define the grid of hyperparameters
+rf_grid <- expand.grid(
+  mtry = c(2, 5, 10, 15),       # Number of variables tried at each split
+  ntree = c(100, 200, 300),     # Number of trees
+  maxnodes = c(10, 30, 50),     # Maximum number of terminal nodes
+  nodesize = c(1, 5, 10)        # Minimum size of terminal nodes
+)
+
+# Custom function to train and get accuracy for a given set of parameters
+grid_results <- data.frame()
+for (i in 1:nrow(rf_grid)) {
+  params <- rf_grid[i, ]
+  
+  rf_model <- randomForest(
+    x = X_train,
+    y = as.factor(y_train),
+    mtry = params$mtry,
+    ntree = params$ntree,
+    maxnodes = params$maxnodes,
+    nodesize = params$nodesize
+  )
+  
+  preds <- predict(rf_model, X_test)
+  acc <- confusionMatrix(preds, as.factor(y_test))$overall["Accuracy"]
+  
+  grid_results <- rbind(grid_results, cbind(rf_grid[i, ], Accuracy = acc))
+}
+
+# Show top results
+grid_results <- grid_results[order(-grid_results$Accuracy), ]
+print(head(grid_results, 5))
+---------------------------
+
+Train Baseline Random Forest with Best Parameters
+```{r}
+best_mtry <- 2
+best_ntree <- 200
+best_maxnodes <- 50
+best_nodesize <- 1
+
+```
+
+
+```{r}
+set.seed(123)
+
+start_time <- Sys.time()
+
+rf_baseline <- randomForest(
+  x = X_train,
+  y = as.factor(y_train),
+  mtry = best_mtry,
+  ntree = best_ntree,
+  maxnodes = best_maxnodes,
+  nodesize = best_nodesize
+)
+
+pred_rf_baseline <- predict(rf_baseline, X_test, type = "response")
+end_time <- Sys.time()
+runtime_rf_baseline <- as.numeric(difftime(end_time, start_time, units = "secs"))
+runtime_rf_baseline
+
+cm_rf_baseline <- confusionMatrix(pred_rf_baseline, as.factor(y_test), positive = "1")
+roc_rf_baseline <- roc(as.numeric(as.character(y_test)), as.numeric(pred_rf_baseline))
+
+print(cm_rf_baseline)
+
+```
+
+
+SMOTE + Random Forest
+```{r}
+set.seed(123)
+smote_data <- SMOTE(X_train_df, y_train)
+X_smote <- smote_data$data[, -ncol(smote_data$data)]
+y_smote <- as.factor(smote_data$data$class)
+
+start_time <- Sys.time()
+rf_smote <- randomForest(
+  x = X_smote,
+  y = y_smote,
+  mtry = best_mtry,
+  ntree = best_ntree,
+  maxnodes = best_maxnodes,
+  nodesize = best_nodesize
+)
+
+pred_rf_smote <- predict(rf_smote, X_test)
+end_time <- Sys.time()
+runtime_rf_smote <- as.numeric(difftime(end_time, start_time, units = "secs"))
+runtime_rf_smote
+
+cm_rf_smote <- confusionMatrix(pred_rf_smote, as.factor(y_test), positive = "1")
+roc_rf_smote <- roc(as.numeric(as.character(y_test)), as.numeric(pred_rf_smote))
+
+print(cm_rf_smote)
+
+```
+
+
+ADASYN + Random Forest
+```{r}
+set.seed(123)
+adas_data <- ADAS(X_train_df, y_train)
+X_adas <- adas_data$data[, -ncol(adas_data$data)]
+y_adas <- as.factor(adas_data$data$class)
+
+start_time <- Sys.time()
+rf_adas <- randomForest(
+  x = X_adas,
+  y = y_adas,
+  mtry = best_mtry,
+  ntree = best_ntree,
+  maxnodes = best_maxnodes,
+  nodesize = best_nodesize
+)
+
+pred_rf_adas <- predict(rf_adas, X_test)
+end_time <- Sys.time()
+runtime_rf_adasyn <- as.numeric(difftime(end_time, start_time, units = "secs"))
+runtime_rf_adasyn
+
+cm_rf_adas <- confusionMatrix(pred_rf_adas, as.factor(y_test), positive = "1")
+roc_rf_adas <- roc(as.numeric(as.character(y_test)), as.numeric(pred_rf_adas))
+
+print(cm_rf_adas)
+
+```
+
+
+Cost-Sensitive Random Forest
+```{r}
+set.seed(123)
+weights_rf <- ifelse(y_train == 0, sum(y_train == 1)/sum(y_train == 0), 1)
+
+start_time <- Sys.time()
+rf_cost <- randomForest(
+  x = X_train,
+  y = as.factor(y_train),
+  mtry = best_mtry,
+  ntree = best_ntree,
+  maxnodes = best_maxnodes,
+  nodesize = best_nodesize,
+  classwt = c("0" = weights_rf[1], "1" = weights_rf[2])
+)
+
+pred_rf_cost <- predict(rf_cost, X_test)
+
+end_time <- Sys.time()
+runtime_rf_cost <- as.numeric(difftime(end_time, start_time, units = "secs"))
+runtime_rf_cost
+
+cm_rf_cost <- confusionMatrix(pred_rf_cost, as.factor(y_test), positive = "1")
+roc_rf_cost <- roc(as.numeric(as.character(y_test)), as.numeric(pred_rf_cost))
+
+print(cm_rf_cost)
+
+```
+
+
+Plot ROC Curves
+```{r}
+plot.roc(roc_rf_baseline, col = "blue", lwd = 2, main = "ROC Curves for Random Forest Models(Healthcare Fraud)", xlim = c(1, 0),xlab = "False Positive Rate",ylab = "True Positive Rate")
+lines(roc_rf_smote, col = "green", lwd = 2)
+lines(roc_rf_adas, col = "red", lwd = 2)
+lines(roc_rf_cost, col = "purple", lwd = 2)
+legend("bottomright", legend = c("Baseline", "SMOTE", "ADASYN", "Cost-sensitive"),
+       col = c("blue", "green", "red", "purple"), lwd = 2)
+
+
+
+```
+
+
+Comparing Results
+
+```{r}
+results_rf_fraud <- data.frame(
+  Method = c("Baseline", "SMOTE", "ADASYN", "Cost-sensitive"),
+  Accuracy = c(
+    cm_rf_baseline$overall["Accuracy"],
+    cm_rf_smote$overall["Accuracy"],
+    cm_rf_adas$overall["Accuracy"],
+    cm_rf_cost$overall["Accuracy"]
+  ),
+  Precision = c(
+    cm_rf_baseline$byClass["Precision"],
+    cm_rf_smote$byClass["Precision"],
+    cm_rf_adas$byClass["Precision"],
+    cm_rf_cost$byClass["Precision"]
+  ),
+  Recall = c(
+    cm_rf_baseline$byClass["Recall"],
+    cm_rf_smote$byClass["Recall"],
+    cm_rf_adas$byClass["Recall"],
+    cm_rf_cost$byClass["Recall"]
+  ),
+  F1 = c(
+    cm_rf_baseline$byClass["F1"],
+    cm_rf_smote$byClass["F1"],
+    cm_rf_adas$byClass["F1"],
+    cm_rf_cost$byClass["F1"]
+  ),
+  AUC = c(
+    auc(roc_rf_baseline),
+    auc(roc_rf_smote),
+    auc(roc_rf_adas),
+    auc(roc_rf_cost)
+  )
+)
+
+print(results_rf_fraud)
+
+```
+
+
+Decision Trees
+
+1. Baseline Decision Tree
+```{r}
+library(rpart)
+library(pROC)
+library(caret)
+
+set.seed(123)
+start_time <- Sys.time()
+
+tree_baseline <- rpart(PotentialFraud ~ ., data = train_data, method = "class", control = rpart.control(cp = 0.005, maxdepth = 7, minsplit = 10, minbucket = 5))
+pred_tree_baseline <- predict(tree_baseline, newdata = X_test, type = "class")
+
+end_time <- Sys.time()
+runtime_tree_baseline <- as.numeric(difftime(end_time, start_time, units = "secs"))
+
+pred_probs_baseline <- predict(tree_baseline, newdata = X_test, type = "prob")[, 2]
+pred_class_baseline <- factor(pred_tree_baseline, levels = c(0, 1))
+cm_baseline <- confusionMatrix(pred_class_baseline, as.factor(y_test), positive = "1")
+roc_baseline <- roc(as.numeric(as.character(y_test)), pred_probs_baseline)
+
+print(cm_baseline)
+
+```
+
+
+2. SMOTE + Decision tree
+```{r}
+set.seed(123)
+smote_data <- SMOTE(X_train_df, y_train)
+X_smote <- smote_data$data[, -ncol(smote_data$data)]
+y_smote <- as.factor(smote_data$data$class)
+smote_train_data <- cbind(X_smote, PotentialFraud = y_smote)
+
+start_time <- Sys.time()
+tree_smote <- rpart(PotentialFraud ~ ., data = smote_train_data, method = "class", control = rpart.control(cp = 0.005, maxdepth = 7, minsplit = 10, minbucket = 5))
+pred_probs_smote <- predict(tree_smote, newdata = X_test, type = "prob")[, 2]
+pred_class_smote <- factor(ifelse(pred_probs_smote > 0.5, 1, 0), levels = c(0, 1))
+
+end_time <- Sys.time()
+runtime_tree_smote <- as.numeric(difftime(end_time, start_time, units = "secs"))
+cm_smote <- confusionMatrix(pred_class_smote, as.factor(y_test), positive = "1")
+roc_smote <- roc(as.numeric(as.character(y_test)), pred_probs_smote)
+
+print(cm_smote)
+
+```
+
+
+3. ADASYN + Decision tree
+```{r}
+set.seed(123)
+adas_data <- ADAS(X_train_df, y_train)
+X_adas <- adas_data$data[, -ncol(adas_data$data)]
+y_adas <- as.factor(adas_data$data$class)
+adasyn_train_data <- cbind(X_adas, PotentialFraud = y_adas)
+
+start_time <- Sys.time()
+tree_adasyn <- rpart(PotentialFraud ~ ., data = adasyn_train_data, method = "class", control = rpart.control(cp = 0.005, maxdepth = 7, minsplit = 10, minbucket = 5))
+pred_probs_adasyn <- predict(tree_adasyn, newdata = X_test, type = "prob")[, 2]
+pred_class_adasyn <- factor(ifelse(pred_probs_adasyn > 0.5, 1, 0), levels = c(0, 1))
+
+end_time <- Sys.time()
+runtime_tree_adasyn <- as.numeric(difftime(end_time, start_time, units = "secs"))
+cm_adasyn <- confusionMatrix(pred_class_adasyn, as.factor(y_test), positive = "1")
+roc_adasyn <- roc(as.numeric(as.character(y_test)), pred_probs_adasyn)
+
+print(cm_adasyn)
+```
+
+
+4. Cost-Sensitive Decision Tree
+```{r}
+set.seed(123)
+weight_for_0 <- sum(y_train == 1) / sum(y_train == 0)
+weight_for_1 <- 1
+weights_vec <- ifelse(y_train == 0, weight_for_0, weight_for_1)
+
+start_time <- Sys.time()
+tree_cost <- rpart(PotentialFraud ~ ., data = train_data, method = "class",control = rpart.control(cp = 0.005, maxdepth = 7, minsplit = 10, minbucket = 5), weights = weights_vec)
+pred_probs_cost <- predict(tree_cost, newdata = X_test, type = "prob")[, 2]
+pred_class_cost <- factor(ifelse(pred_probs_cost > 0.5, 1, 0), levels = c(0, 1))
+
+end_time <- Sys.time()
+runtime_tree_cost <- as.numeric(difftime(end_time, start_time, units = "secs"))
+cm_cost <- confusionMatrix(pred_class_cost, as.factor(y_test), positive = "1")
+roc_cost <- roc(as.numeric(as.character(y_test)), pred_probs_cost)
+
+print(cm_cost)
+```
+
+
+5. Plot ROC Curves
+```{r}
+plot(roc_baseline, col = "blue", lwd = 2, main = "ROC Curves for Decision Tree Models (Healthcare Fraud)", xlim = c(1, 0), xlab = "False Positive Rate", ylab = "True Positive Rate")
+lines(roc_smote, col = "green", lwd = 2)
+lines(roc_adasyn, col = "red", lwd = 2)
+lines(roc_cost, col = "purple", lwd = 2)
+legend("bottomright", legend = c("Baseline", "SMOTE", "ADASYN", "Cost-sensitive"), col = c("blue", "green", "red", "purple"), lwd = 2)
+
+
+```
+
+
+6. Compare All Decision Tree Models
+
+```{r}
+results_tree_fraud <- data.frame(
+  Method = c("Baseline", "SMOTE", "ADASYN", "Cost-sensitive"),
+  Accuracy = c(
+    cm_baseline$overall["Accuracy"],
+    cm_smote$overall["Accuracy"],
+    cm_adasyn$overall["Accuracy"],
+    cm_cost$overall["Accuracy"]
+  ),
+  Precision = c(
+    cm_baseline$byClass["Precision"],
+    cm_smote$byClass["Precision"],
+    cm_adasyn$byClass["Precision"],
+    cm_cost$byClass["Precision"]
+  ),
+  Recall = c(
+    cm_baseline$byClass["Recall"],
+    cm_smote$byClass["Recall"],
+    cm_adasyn$byClass["Recall"],
+    cm_cost$byClass["Recall"]
+  ),
+  F1 = c(
+    cm_baseline$byClass["F1"],
+    cm_smote$byClass["F1"],
+    cm_adasyn$byClass["F1"],
+    cm_cost$byClass["F1"]
+  ),
+  AUC = c(
+    auc(roc_baseline),
+    auc(roc_smote),
+    auc(roc_adasyn),
+    auc(roc_cost)
+  )
+)
+print(results_tree_fraud)
+
+```
+
+
+REALTIME INFERENCES
+
+Loading the models 
+```{r}
+# Logistic (ADASYN)
+logit_model <- readRDS("logit_adasyn_healthcare.rds")
+
+# XGBoost (ADASYN)
+xgb_model <- xgb.load("xgb_adasyn_healthcare.model")
+
+```
+
+
+Preparing test data & fraud pool
+```{r}
+# Assumes X_test, y_test exist
+X_test_df <- as.data.frame(X_test)
+
+# Ensure labels are {0,1} factor, then numeric 0/1
+y_test_factor  <- factor(y_test, levels = c(0, 1))
+y_test_numeric <- as.numeric(as.character(y_test_factor))
+
+# Fraud-only pool for Monte Carlo sampling
+fraud_idx    <- which(y_test_numeric == 1L)
+stopifnot(length(fraud_idx) > 0)
+fraud_pool_X <- X_test_df[fraud_idx, , drop = FALSE]
+
+```
+
+
+Simulation settings
+```{r}
+domain_name  <- "healthcare"
+lambda_fraud <- 4.0667   
+runs         <- 10000
+thr_logit    <- 0.50
+thr_xgb      <- 0.50
+set.seed(123)
+
+```
+
+
+
+Probability helper (glm / caret / xgboost)
+```{r}
+predict_prob <- function(model, newdata) {
+  cls <- class(model)
+
+  if ("glm" %in% cls) {
+    return(as.numeric(predict(model, newdata = newdata, type = "response")))
+  }
+
+  if ("train" %in% cls) {
+    p <- try(predict(model, newdata = newdata, type = "prob"), silent = TRUE)
+    if (!inherits(p, "try-error") && is.data.frame(p) && "1" %in% colnames(p)) {
+      return(as.numeric(p[["1"]]))
+    }
+    p <- predict(model, newdata = newdata, type = "raw")
+    return(as.numeric(p))
+  }
+
+  if ("xgb.Booster" %in% cls) {
+    dm <- xgb.DMatrix(data = data.matrix(newdata))
+    return(as.numeric(predict(model, dm)))
+  }
+
+  p <- predict(model, newdata = newdata)
+  if (is.matrix(p) || is.data.frame(p)) {
+    if ("1" %in% colnames(p)) return(as.numeric(p[, "1"]))
+    if (ncol(p) == 1)         return(as.numeric(p[, 1]))
+  }
+  as.numeric(p)
+}
+
+```
+
+
+Fraud-only Monte-Carlo simulator
+```{r}
+simulate_realtime_fraud_only <- function(model, threshold, lambda_fraud, runs, fraud_pool_X) {
+  arrivals_F   <- rpois(runs, lambda = lambda_fraud)
+  tp_vec       <- integer(runs)
+  det_rate_pct <- rep(NA_real_, runs)
+
+  for (r in seq_len(runs)) {
+    F <- arrivals_F[r]
+    if (F == 0) next
+    s_idx <- sample.int(nrow(fraud_pool_X), size = F, replace = TRUE)
+    X_r   <- fraud_pool_X[s_idx, , drop = FALSE]
+
+    p_r   <- predict_prob(model, X_r)
+    yhat  <- as.integer(p_r >= threshold)
+    TP    <- sum(yhat == 1L)
+
+    tp_vec[r]       <- TP
+    det_rate_pct[r] <- 100 * TP / F
+  }
+
+  mc_df   <- data.frame(run = seq_len(runs),
+                        fraud_arrivals = arrivals_F,
+                        tp = tp_vec,
+                        detection_pct = det_rate_pct)
+
+  plot_df <- dplyr::filter(mc_df, !is.na(detection_pct))
+
+  summary_stats <- plot_df |>
+    summarise(
+      runs                 = n(),
+      mean_detection_pct   = mean(detection_pct),
+      median_detection_pct = median(detection_pct),
+      p05_detection_pct    = quantile(detection_pct, 0.05),
+      p95_detection_pct    = quantile(detection_pct, 0.95),
+      mean_tp_per_sec      = lambda_fraud * mean(detection_pct)/100,
+      p05_tp_per_sec       = lambda_fraud * quantile(detection_pct, 0.05)/100,
+      p95_tp_per_sec       = lambda_fraud * quantile(detection_pct, 0.95)/100
+    )
+
+  # 95% bootstrap CI for the mean detection %
+  set.seed(1)
+  B <- 2000
+  boot_means <- replicate(B, mean(sample(plot_df$detection_pct, replace = TRUE)))
+  ci <- quantile(boot_means, c(0.025, 0.975))
+  summary_stats$mean_det_pct_ci95_low  <- ci[1]
+  summary_stats$mean_det_pct_ci95_high <- ci[2]
+
+  list(mc_df = mc_df, plot_df = plot_df, summary = summary_stats)
+}
+
+```
+
+
+Running for both Models
+```{r}
+res_logit <- simulate_realtime_fraud_only(logit_model, thr_logit, lambda_fraud, runs, fraud_pool_X)
+res_xgb   <- simulate_realtime_fraud_only(xgb_model,   thr_xgb,   lambda_fraud, runs, fraud_pool_X)
+
+```
+
+
+Summary Tables
+```{r}
+summary_table <- bind_rows(
+  res_logit$summary |> mutate(model = "Logistic (ADASYN)", threshold = thr_logit),
+  res_xgb$summary   |> mutate(model = "XGBoost (ADASYN)",  threshold = thr_xgb)
+) |>
+  dplyr::select(model, threshold,
+         mean_detection_pct, mean_det_pct_ci95_low, mean_det_pct_ci95_high,
+         median_detection_pct, p05_detection_pct, p95_detection_pct,
+         mean_tp_per_sec, p05_tp_per_sec, p95_tp_per_sec)
+
+print(summary_table)
+
+```
+ADASYN-balanced Logistic and XGBoost exhibit weak realtime detection (mean 23% vs 15%; p05 = 0 for both), indicating frequent seconds with no frauds caught and high variability, with Logistic only occasionally reaching ~67% at the 95th percentile.
+
+
+Visuals (ECDF + histogram)
+```{r}
+both_ecdf <- bind_rows(
+  res_logit$plot_df |> mutate(model = "Logistic (ADASYN)"),
+  res_xgb$plot_df   |> mutate(model = "XGBoost (ADASYN)")
+)
+
+ggplot(both_ecdf, aes(x = detection_pct, color = model)) +
+  stat_ecdf(geom = "step", linewidth = 1) +
+  labs(
+    title = paste0("ECDF of per-second detection — Monte Carlo (", domain_name, ")"),
+    subtitle = paste0(runs, " runs; λ_fraud = ", lambda_fraud, " fraud/sec"),
+    x = "Detection Rate per second (%)", y = "ECDF"
+  ) +
+  theme_minimal(base_size = 12)
+
+ggplot(both_ecdf, aes(x = detection_pct, fill = model)) +
+  geom_histogram(alpha = 0.6, bins = 40, position = "identity") +
+  labs(
+    title = paste0("Detection rate per second — Monte Carlo (", domain_name, ")"),
+    subtitle = paste0(runs, " runs; λ_fraud = ", lambda_fraud, " fraud/sec"),
+    x = "Detection Rate per second (%)", y = "Count of runs"
+  ) +
+  theme_minimal(base_size = 12)
+
+```
+
+ECDF
+The ECDF curves rise steeply at low detection values:
+~40–50% of runs for Logistic are at or below 20% detection.
+For XGBoost, ~50% of runs are stuck at 0% detection.
+Logistic’s curve is shifted slightly right (better), but still indicates weak detection across most seconds.
+
+
+Histogram
+Most runs are piled up near 0% detection, especially for XGBoost.
+Logistic has a slightly wider spread, with more runs reaching into the 20–40% band, but still a large mass at low detection.
+Only a small fraction of runs hit 50–100%, indicating very inconsistent performance.
+
+
+
+1 Second and 10 Seconds
+
+```{r}
+library(dplyr)
+library(pROC)
+library(xgboost)
+
+
+# Logistic (ADASYN)
+logit_model <- readRDS("logit_adasyn_healthcare.rds")
+
+# XGBoost (ADASYN)
+xgb_model   <- xgb.load("xgb_adasyn_healthcare.model")
+
+X_test_df      <- as.data.frame(X_test)
+y_test_factor  <- factor(y_test, levels = c(0, 1))        # ensure {0,1}
+y_test_numeric <- as.numeric(as.character(y_test_factor)) # numeric {0,1}
+
+stopifnot(nrow(X_test_df) == length(y_test_numeric))
+stopifnot(any(y_test_numeric == 1L), any(y_test_numeric == 0L))  # both classes present
+
+# (Optional) Fraud-only pool if you need it elsewhere
+fraud_idx    <- which(y_test_numeric == 1L)
+stopifnot(length(fraud_idx) > 0)
+fraud_pool_X <- X_test_df[fraud_idx, , drop = FALSE]
+
+```
+
+
+
+```{r}
+# simulation settings
+domain_name    <- "healthcare"
+lambda_per_sec <- 4.0667   # expected transactions per SECOND
+runs           <- 10000
+thr_logit      <- 0.50
+thr_xgb        <- 0.50
+set.seed(123)
+```
+
+
+```{r}
+# 3) Probability helper
+predict_prob <- function(model, newdata) {
+  cls <- class(model)
+
+  # glm (logistic)
+  if ("glm" %in% cls) {
+    return(as.numeric(predict(model, newdata = newdata, type = "response")))
+  }
+
+  # caret::train
+  if ("train" %in% cls) {
+    p <- try(predict(model, newdata = newdata, type = "prob"), silent = TRUE)
+    if (!inherits(p, "try-error") && is.data.frame(p) && "1" %in% colnames(p)) {
+      return(as.numeric(p[["1"]]))
+    }
+    p <- predict(model, newdata = newdata, type = "raw")
+    return(as.numeric(p))
+  }
+
+  # xgboost booster
+  if ("xgb.Booster" %in% cls) {
+    dm <- xgb.DMatrix(data = data.matrix(newdata))
+    return(as.numeric(predict(model, dm)))
+  }
+
+  # Fallbacks
+  p <- predict(model, newdata = newdata)
+  if (is.matrix(p) || is.data.frame(p)) {
+    if ("1" %in% colnames(p)) return(as.numeric(p[, "1"]))
+    if (ncol(p) == 1)         return(as.numeric(p[, 1]))
+  }
+  as.numeric(p)
+}
+
+```
+
+
+
+```{r}
+# Monte Carlo Simulations
+simulate_realtime_fullpool <- function(model, threshold, lambda_rate_per_sec, runs,
+                                       X_pool, y_pool, window_secs = 1L) {
+  N <- nrow(X_pool)
+  arrivals <- rpois(runs, lambda = lambda_rate_per_sec * window_secs)
+
+  TP <- FP <- TN <- FN <- integer(runs)
+  precision <- recall <- accuracy <- f1 <- rep(NA_real_, runs)
+  auc_vec  <- rep(NA_real_, runs)
+
+  for (r in seq_len(runs)) {
+    F <- arrivals[r]
+    if (F == 0) next
+
+    idx <- sample.int(N, size = F, replace = TRUE)
+    X_r <- X_pool[idx, , drop = FALSE]
+    y_r <- y_pool[idx]
+
+    p_r  <- predict_prob(model, X_r)
+    yhat <- as.integer(p_r >= threshold)
+
+    TP[r] <- sum(yhat == 1L & y_r == 1L)
+    FP[r] <- sum(yhat == 1L & y_r == 0L)
+    TN[r] <- sum(yhat == 0L & y_r == 0L)
+    FN[r] <- sum(yhat == 0L & y_r == 1L)
+
+    if ((TP[r] + FP[r]) > 0) precision[r] <- TP[r] / (TP[r] + FP[r])
+    if ((TP[r] + FN[r]) > 0) recall[r]    <- TP[r] / (TP[r] + FN[r])
+    accuracy[r] <- (TP[r] + TN[r]) / F
+    if (!is.na(precision[r]) && !is.na(recall[r]) && (precision[r] + recall[r]) > 0) {
+      f1[r] <- 2 * precision[r] * recall[r] / (precision[r] + recall[r])
+    }
+
+    # AUC computed only if both classes appear in the window
+    if (any(y_r == 1L) && any(y_r == 0L)) {
+      roc_obj <- try(pROC::roc(response = y_r, predictor = p_r, quiet = TRUE), silent = TRUE)
+      if (!inherits(roc_obj, "try-error")) auc_vec[r] <- as.numeric(pROC::auc(roc_obj))
+    }
+  }
+
+  mc_df <- data.frame(
+    run = seq_len(runs),
+    window_secs = window_secs,
+    arrivals = arrivals,   # per window
+    TP = TP, FP = FP, TN = TN, FN = FN,
+    precision = precision, recall = recall, accuracy = accuracy, f1 = f1, auc = auc_vec
+  )
+
+  summary_tbl <- mc_df |>
+    summarise(
+      runs               = n(),
+      window_secs        = first(window_secs),
+      runs_with_tx       = sum(arrivals > 0),
+      mean_TP            = mean(TP),       mean_FP = mean(FP),
+      mean_TN            = mean(TN),       mean_FN = mean(FN),
+      mean_precision     = mean(precision, na.rm = TRUE),
+      mean_recall        = mean(recall,    na.rm = TRUE),
+      mean_accuracy      = mean(accuracy,  na.rm = TRUE),
+      mean_f1            = mean(f1,        na.rm = TRUE),
+      mean_auc           = mean(auc,       na.rm = TRUE),
+      median_auc         = median(auc,     na.rm = TRUE),
+      n_auc_runs         = sum(!is.na(auc))
+    )
+
+  list(mc_df = mc_df, summary = summary_tbl)
+}
+```
+
+
+
+```{r}
+# Running both models at 1s and 10s windows
+set.seed(123)
+
+# Logistic
+res_logit_1s  <- simulate_realtime_fullpool(
+  model = logit_model, threshold = thr_logit,
+  lambda_rate_per_sec = lambda_per_sec, runs = runs,
+  X_pool = X_test_df, y_pool = y_test_numeric, window_secs = 1L
+)
+res_logit_10s <- simulate_realtime_fullpool(
+  model = logit_model, threshold = thr_logit,
+  lambda_rate_per_sec = lambda_per_sec, runs = runs,
+  X_pool = X_test_df, y_pool = y_test_numeric, window_secs = 10L
+)
+
+# XGBoost
+res_xgb_1s  <- simulate_realtime_fullpool(
+  model = xgb_model, threshold = thr_xgb,
+  lambda_rate_per_sec = lambda_per_sec, runs = runs,
+  X_pool = X_test_df, y_pool = y_test_numeric, window_secs = 1L
+)
+res_xgb_10s <- simulate_realtime_fullpool(
+  model = xgb_model, threshold = thr_xgb,
+  lambda_rate_per_sec = lambda_per_sec, runs = runs,
+  X_pool = X_test_df, y_pool = y_test_numeric, window_secs = 10L
+)
+
+```
+
+
+
+```{r}
+# Compare summaries
+summary_table <- bind_rows(
+  res_logit_1s$summary  |> mutate(model = "Logistic (ADASYN)", time_unit = "1 sec",  threshold = thr_logit),
+  res_logit_10s$summary |> mutate(model = "Logistic (ADASYN)", time_unit = "10 sec", threshold = thr_logit),
+  res_xgb_1s$summary    |> mutate(model = "XGBoost (ADASYN)",  time_unit = "1 sec",  threshold = thr_xgb),
+  res_xgb_10s$summary   |> mutate(model = "XGBoost (ADASYN)",  time_unit = "10 sec", threshold = thr_xgb)
+) |>
+  dplyr::select(model, time_unit, mean_accuracy, mean_precision, mean_recall, mean_f1, mean_auc)
+
+print(summary_table)
+```
+
+
+```{r}
+
+```
+
+
+
+
